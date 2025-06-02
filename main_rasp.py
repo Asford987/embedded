@@ -27,48 +27,109 @@ class OCREngine:
         """
         raise NotImplementedError
 
-# ── paste this over the old TesseractOCR class ──────────────────────────────
-class TesseractOCR(OCREngine):
+# ---------------------------------------------------------------------------#
+#                       BETTER SINGLE-CHAR OCR ENGINE                        #
+# ---------------------------------------------------------------------------#
+class BestPointsOCR(OCREngine):
     """
-    Tesseract backend that *refuses* to emit text unless
-    **all** recognised tokens have confidence ≥ min_conf.
+    CNN-based recogniser trained on the EMNIST family (white glyph, black
+    background, 28×28).  The new pre-processing works with camera frames
+    where the glyph may be dark-on-light or light-on-dark and fills most of
+    the view.
     """
-    def __init__(self, min_conf: int = 85, lang: str = "eng"):
-        from pytesseract import image_to_data, Output
-        self._image_to_data = image_to_data
-        self._Output = Output
-        self._min_conf = min_conf
-        self._lang = lang
 
-    def ocr(self, image_bgr):
-        data = self._image_to_data(
-            image_bgr,
-            lang=self._lang,
-            output_type=self._Output.DICT,
-            config="--psm 6 --oem 3",
-        )
+    def __init__(
+        self,
+        model_path: str = "Best_points2.h5",
+        min_conf: float = 0.60,
+        charset: str | List[str] | None = None,
+        input_size: Tuple[int, int] = (28, 28),
+    ):
+        from tensorflow.keras.models import load_model
+        self._model = load_model(model_path, compile=False)
+        self._min_conf = float(min_conf)
+        self._input_size = tuple(map(int, input_size))
 
-        words: List[str] = []
-        for word, conf in zip(data["text"], data["conf"]):
-            word = word.strip()
-            try:
-                conf_val = int(conf)
-            except ValueError:
-                # Tesseract sometimes returns '' or '-1'
-                continue
+        default_charset = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ-"
+        self._charset = list(charset) if charset else list(default_charset)
+        if self._model.output_shape[-1] != len(self._charset):
+            raise ValueError(
+                f"Model expects {self._model.output_shape[-1]} classes, "
+                f"but charset has {len(self._charset)}"
+            )
 
-            # Reject if confidence is too low
-            if conf_val < self._min_conf:
-                return "", False
-
-            if word:                      # keep non-empty words
-                words.append(word)
-
-        if not words:
+    # ------------------------------------------------------------------ #
+    # public API                                                          #
+    # ------------------------------------------------------------------ #
+    def ocr(self, image_bgr: np.ndarray) -> Tuple[str, bool]:
+        binary = self._make_emnist_binary(image_bgr)
+        crop   = self._largest_blob(binary)
+        if crop is None:                      # no glyph found
             return "", False
 
-        return " ".join(words), True
-# ────────────────────────────────────────────────────────────────────────────
+        canvas = self._centre_on_square(crop)
+        canvas = cv2.GaussianBlur(canvas, (3, 3), 0)      # soften edges
+        canvas = canvas.astype("float32") / 255.0
+        canvas = np.expand_dims(canvas, (-1, 0))          # → (1,28,28,1)
+
+        prob = self._model.predict(canvas, verbose=0)[0]
+        cls, conf = int(prob.argmax()), float(prob.max())
+        print(f"Pred: {self._charset[cls]}   conf={conf:.2f}")
+
+        return (self._charset[cls], True) if conf >= self._min_conf else ("", False)
+
+    # ------------------------------------------------------------------ #
+    # helpers                                                             #
+    # ------------------------------------------------------------------ #
+    def _make_emnist_binary(self, img_bgr: np.ndarray) -> np.ndarray:
+        """Return a bin-image with **white glyph on black** (EMNIST style)."""
+        gray  = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+
+        # local contrast normalisation → robust to uneven lighting
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        gray  = clahe.apply(gray)
+
+        # global Otsu threshold (no inversion yet)
+        _, th = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+        # decide polarity: glyph pixels should be minority
+        if np.mean(th) > 127:                 # too many white → invert
+            th = cv2.bitwise_not(th)
+
+        # slight closing removes pin-holes inside strokes
+        kernel = np.ones((3, 3), np.uint8)
+        th = cv2.morphologyEx(th, cv2.MORPH_CLOSE, kernel, iterations=1)
+        return th
+
+    def _largest_blob(self, binary: np.ndarray) -> np.ndarray | None:
+        contours, _ = cv2.findContours(
+            binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not contours:
+            return None
+        cnt = max(contours, key=cv2.contourArea)
+        x, y, w, h = cv2.boundingRect(cnt)
+
+        # ignore specks under 1 % of the frame
+        if w * h < 0.01 * binary.size:
+            return None
+
+        pad = int(0.10 * max(w, h))           # 10 % padding
+        x0 = max(x - pad, 0)
+        y0 = max(y - pad, 0)
+        x1 = min(x + w + pad, binary.shape[1])
+        y1 = min(y + h + pad, binary.shape[0])
+        return binary[y0:y1, x0:x1]
+
+    def _centre_on_square(self, crop: np.ndarray) -> np.ndarray:
+        """Place crop on square black canvas, keep aspect, resize to 28×28."""
+        h, w = crop.shape
+        side = max(h, w)
+        canvas = np.zeros((side, side), dtype=np.uint8)
+        y_off = (side - h) // 2
+        x_off = (side - w) // 2
+        canvas[y_off:y_off + h, x_off:x_off + w] = crop
+        return cv2.resize(canvas, self._input_size, interpolation=cv2.INTER_AREA)
+
 
 
 # ---------------------------------------------------------------------------#
@@ -160,7 +221,7 @@ class OnlineViewer:
 #                               MAIN LOOP                                    #
 # ---------------------------------------------------------------------------#
 def main(
-    ocr_cls: Type[OCREngine] = TesseractOCR,
+    ocr_cls: Type[OCREngine] = BestPointsOCR,
     camera_cfg: CameraConfig = CameraConfig(),
     ui_layout: UILayout = UILayout(),
 ):
